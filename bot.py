@@ -2,162 +2,146 @@ import discord
 from discord.ext import commands
 import yt_dlp
 import subprocess
-import asyncio
 import os
-from dotenv import load_dotenv
+import asyncio
+import signal
 
-# ---------- Загрузка переменных из .env ----------
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-YOUTUBE_RTMP = os.getenv("YOUTUBE_RTMP")
-COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
-DOWNLOAD_FOLDER = os.getenv("DOWNLOAD_FOLDER", "downloads")
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+# ---------------- CONFIG ----------------
+TOKEN = "MTQ4MzQwMTkzMTc4NjU1NTQzNQ.Gb5o2r.KEhF_bwCDCrgoudZ1_Ac6xi9LKf20SDVbDzckQ"
+RTMP_URL = "rtmp://your.rtmp.server/live/tjp4-hbx3-uawe-dgqe-64dp"
+DOWNLOAD_DIR = "./downloads"
 
-# ---------- Инициализация бота ----------
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ---------------- BOT SETUP ----------------
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- Глобальные переменные ----------
-ffmpeg_process = None
-video_queue = asyncio.Queue()
-current_video = None
+current_process = None
 current_file = None
 
-# ---------- Функции ----------
-
-def download_audio_file(url: str):
-    """Скачиваем аудио через yt-dlp в файл"""
+# ---------------- HELPERS ----------------
+def download_video(url):
     ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(DOWNLOAD_FOLDER, "%(title)s.%(ext)s"),
-        "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
-        "quiet": True,
+        'format': 'bestvideo+bestaudio/best',
+        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
+        'merge_output_format': 'mp4',
+        'quiet': True
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        file_path = ydl.prepare_filename(info)
-        return file_path, info.get("title", "audio")
+        filename = ydl.prepare_filename(info)
 
-def start_ffmpeg_audio(file_path: str):
-    """Запуск ffmpeg для стрима только аудио (-vn)"""
-    command = [
-        "ffmpeg",
-        "-re",
-        "-i", file_path,
-        "-vn",  # только аудио
-        "-c:a", "aac",
-        "-b:a", "160k",
-        "-ar", "44100",
-        "-f", "flv",
-        YOUTUBE_RTMP
+        # если расширение не mp4 — заменим
+        if not filename.endswith(".mp4"):
+            filename = os.path.splitext(filename)[0] + ".mp4"
+
+    return filename
+
+
+def start_stream(filename):
+    global current_process
+
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-re',
+        '-i', filename,
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-maxrate', '3000k',
+        '-bufsize', '6000k',
+        '-pix_fmt', 'yuv420p',
+        '-g', '50',
+        '-c:a', 'aac',
+        '-b:a', '160k',
+        '-ar', '44100',
+        '-f', 'flv',
+        RTMP_URL
     ]
-    return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-async def monitor_ffmpeg(ctx):
-    """Мониторинг ffmpeg и авто-рестарт"""
-    global ffmpeg_process, current_video, current_file
-    if ffmpeg_process is None:
-        return
-    await asyncio.sleep(1)
-    while ffmpeg_process.poll() is None:
-        await asyncio.sleep(5)
+    current_process = subprocess.Popen(
+        ffmpeg_cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT
+    )
 
-    await ctx.send(f"⚠️ Стрим завершён: {current_video}")
 
-    # Удаляем временный файл
-    if current_file and os.path.exists(current_file):
+def stop_stream():
+    global current_process
+    if current_process:
+        current_process.send_signal(signal.SIGTERM)
+        current_process.wait()
+        current_process = None
+
+
+def cleanup_file(path):
+    if path and os.path.exists(path):
         try:
-            os.remove(current_file)
-        except Exception as e:
-            await ctx.send(f"❌ Не удалось удалить файл: {current_file}, {e}")
+            os.remove(path)
+        except Exception:
+            pass
 
-    ffmpeg_process = None
-    current_video = None
-    current_file = None
 
-    # Авто-рестарт следующего видео из очереди
-    if not video_queue.empty():
-        await start_next_stream(ctx)
-
-async def start_next_stream(ctx):
-    """Запуск следующего видео из очереди"""
-    global ffmpeg_process, current_video, current_file
-    if video_queue.empty():
-        current_video = None
-        await ctx.send("✅ Очередь пуста. Стрим завершён.")
-        return
-
-    current_video = await video_queue.get()
-    await ctx.send(f"▶️ Подготовка к стриму: {current_video}")
-
-    try:
-        file_path, title = download_audio_file(current_video)
-        current_file = file_path
-
-        ffmpeg_process = start_ffmpeg_audio(file_path)
-        await ctx.send(f"🔊 Стрим начался: {title}")
-
-        bot.loop.create_task(monitor_ffmpeg(ctx))
-
-    except Exception as e:
-        await ctx.send(f"❌ Ошибка при стриме: {e}")
-        ffmpeg_process = None
-        current_video = None
-        current_file = None
-        await start_next_stream(ctx)
-
-# ---------- Команды ----------
-
+# ---------------- COMMANDS ----------------
 @bot.event
 async def on_ready():
     print(f"Бот запущен как {bot.user}")
 
-@bot.command()
-async def add(ctx, url: str):
-    """Добавить видео в очередь"""
-    await video_queue.put(url)
-    await ctx.send(f"➕ Видео добавлено в очередь: {url}")
-    if ffmpeg_process is None:
-        await start_next_stream(ctx)
 
 @bot.command()
-async def skip(ctx):
-    """Пропустить текущее видео"""
-    global ffmpeg_process
-    if ffmpeg_process:
-        ffmpeg_process.terminate()
-        await ctx.send("⏭ Пропускаем текущее видео...")
-    else:
-        await ctx.send("⚠️ Сейчас нет активного стрима.")
+async def start(ctx, url: str):
+    """Скачать видео и начать стрим"""
+    global current_file
+
+    if current_process:
+        await ctx.send("⚠️ Стрим уже запущен!")
+        return
+
+    msg = await ctx.send("⬇️ Скачиваю видео...")
+
+    try:
+        loop = asyncio.get_event_loop()
+        filename = await loop.run_in_executor(None, download_video, url)
+        current_file = filename
+
+        await msg.edit(content=f"✅ Скачано:\n`{filename}`")
+
+        await ctx.send("📡 Запускаю стрим...")
+
+        start_stream(filename)
+
+        await ctx.send("🟢 Стрим запущен!")
+
+    except Exception as e:
+        await ctx.send(f"❌ Ошибка: {e}")
+
 
 @bot.command()
 async def stop(ctx):
-    """Остановить стрим и очистить очередь"""
-    global ffmpeg_process, current_video, current_file
-    if ffmpeg_process:
-        ffmpeg_process.terminate()
-        ffmpeg_process = None
-    while not video_queue.empty():
-        await video_queue.get()
-    if current_file and os.path.exists(current_file):
-        try:
-            os.remove(current_file)
-        except:
-            pass
-    current_video = None
+    """Остановить стрим"""
+    global current_file
+
+    if not current_process:
+        await ctx.send("⚠️ Нет активного стрима.")
+        return
+
+    stop_stream()
+    cleanup_file(current_file)
+
     current_file = None
-    await ctx.send("🛑 Стрим остановлен и очередь очищена.")
+
+    await ctx.send("🔴 Стрим остановлен и файл удалён.")
+
 
 @bot.command()
 async def status(ctx):
-    """Показать статус текущего стрима и очереди"""
-    queue_list = list(video_queue._queue)
-    await ctx.send(
-        f"▶️ Текущее видео: {current_video}\n"
-        f"📺 Очередь ({len(queue_list)}):\n" +
-        ("\n".join(queue_list) if queue_list else "Очередь пуста")
-    )
+    """Статус стрима"""
+    if current_process:
+        await ctx.send("🟢 Стрим активен.")
+    else:
+        await ctx.send("🔴 Стрим остановлен.")
 
+
+# ---------------- RUN ----------------
 bot.run(TOKEN)
