@@ -1,147 +1,176 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import yt_dlp
 import subprocess
-import os
 import asyncio
+import shlex
 import signal
 
 # ---------------- CONFIG ----------------
 TOKEN = "MTQ4MzQwMTkzMTc4NjU1NTQzNQ.Gb5o2r.KEhF_bwCDCrgoudZ1_Ac6xi9LKf20SDVbDzckQ"
 RTMP_URL = "rtmp://your.rtmp.server/live/tjp4-hbx3-uawe-dgqe-64dp"
-DOWNLOAD_DIR = "./downloads"
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Настройки ffmpeg по умолчанию
+DEFAULT_VIDEO_CODEC = "libx264"
+DEFAULT_PRESET = "veryfast"
+DEFAULT_MAXRATE = "3000k"
+DEFAULT_BUFSIZE = "6000k"
+DEFAULT_AUDIO_CODEC = "aac"
+DEFAULT_AUDIO_BITRATE = "160k"
+DEFAULT_AUDIO_RATE = "44100"
 
 # ---------------- BOT SETUP ----------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ---------------- STREAM STATE ----------------
+playlist = []
 current_process = None
-current_file = None
+current_video = None
+streaming = False
 
 # ---------------- HELPERS ----------------
-def download_video(url):
+def create_ffmpeg_cmd(pipe_url, quality=None):
+    """Создаём команду ffmpeg для стрима через stdin"""
+    video_codec = quality.get("vcodec", DEFAULT_VIDEO_CODEC) if quality else DEFAULT_VIDEO_CODEC
+    preset = quality.get("preset", DEFAULT_PRESET) if quality else DEFAULT_PRESET
+    maxrate = quality.get("maxrate", DEFAULT_MAXRATE) if quality else DEFAULT_MAXRATE
+    bufsize = quality.get("bufsize", DEFAULT_BUFSIZE) if quality else DEFAULT_BUFSIZE
+    audio_codec = quality.get("acodec", DEFAULT_AUDIO_CODEC) if quality else DEFAULT_AUDIO_CODEC
+    audio_bitrate = quality.get("abitrate", DEFAULT_AUDIO_BITRATE) if quality else DEFAULT_AUDIO_BITRATE
+    audio_rate = quality.get("arate", DEFAULT_AUDIO_RATE) if quality else DEFAULT_AUDIO_RATE
+
+    cmd = [
+        "ffmpeg",
+        "-re",
+        "-i", "pipe:0",          # input from stdin
+        "-c:v", video_codec,
+        "-preset", preset,
+        "-maxrate", maxrate,
+        "-bufsize", bufsize,
+        "-pix_fmt", "yuv420p",
+        "-g", "50",
+        "-c:a", audio_codec,
+        "-b:a", audio_bitrate,
+        "-ar", str(audio_rate),
+        "-f", "flv",
+        pipe_url
+    ]
+    return cmd
+
+async def stream_video(url, quality=None):
+    """Стримим видео напрямую через yt-dlp + ffmpeg pipe"""
+    global current_process, current_video, streaming
+
     ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-        'merge_output_format': 'mp4',
-        'quiet': True
+        "format": "bestvideo+bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "merge_output_format": "mp4",
+        "outtmpl": "-",
+        "noplaylist": True,
+        "prefer_ffmpeg": True,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
+    streaming = True
+    current_video = url
 
-        # если расширение не mp4 — заменим
-        if not filename.endswith(".mp4"):
-            filename = os.path.splitext(filename)[0] + ".mp4"
+    process = subprocess.Popen(create_ffmpeg_cmd(RTMP_URL, quality),
+                               stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.STDOUT)
+    current_process = process
 
-    return filename
-
-
-def start_stream(filename):
-    global current_process
-
-    ffmpeg_cmd = [
-        'ffmpeg',
-        '-re',
-        '-i', filename,
-        '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-maxrate', '3000k',
-        '-bufsize', '6000k',
-        '-pix_fmt', 'yuv420p',
-        '-g', '50',
-        '-c:a', 'aac',
-        '-b:a', '160k',
-        '-ar', '44100',
-        '-f', 'flv',
-        RTMP_URL
-    ]
-
-    current_process = subprocess.Popen(
-        ffmpeg_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT
-    )
-
-
-def stop_stream():
-    global current_process
-    if current_process:
-        current_process.send_signal(signal.SIGTERM)
-        current_process.wait()
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])  # yt-dlp выводит данные в stdout → ffmpeg stdin
+    except Exception as e:
+        print(f"Ошибка yt-dlp: {e}")
+    finally:
+        if process:
+            process.send_signal(signal.SIGTERM)
+            process.wait()
+        streaming = False
         current_process = None
+        current_video = None
 
-
-def cleanup_file(path):
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-
+async def play_next(ctx):
+    """Автоматическое проигрывание следующего видео из очереди"""
+    global playlist
+    while playlist:
+        next_url = playlist.pop(0)
+        await ctx.send(f"▶️ Начинаю стрим: {next_url}")
+        await stream_video(next_url)
+    await ctx.send("✅ Очередь завершена.")
 
 # ---------------- COMMANDS ----------------
 @bot.event
 async def on_ready():
     print(f"Бот запущен как {bot.user}")
 
+@bot.command()
+async def add(ctx, url: str):
+    """Добавить видео в очередь"""
+    playlist.append(url)
+    await ctx.send(f"➕ Видео добавлено в очередь ({len(playlist)} в очереди)")
 
 @bot.command()
-async def start(ctx, url: str):
-    """Скачать видео и начать стрим"""
-    global current_file
+async def queue(ctx):
+    """Показать очередь"""
+    if not playlist:
+        await ctx.send("🛑 Очередь пустая")
+    else:
+        msg = "\n".join([f"{i+1}. {url}" for i, url in enumerate(playlist)])
+        await ctx.send(f"🎵 Очередь видео:\n{msg}")
 
-    if current_process:
-        await ctx.send("⚠️ Стрим уже запущен!")
+@bot.command()
+async def start(ctx, quality: str = None):
+    """Начать стриминг очереди"""
+    if streaming:
+        await ctx.send("⚠️ Стрим уже идет")
+        return
+    if not playlist:
+        await ctx.send("🛑 Очередь пустая, добавьте видео через !add")
         return
 
-    msg = await ctx.send("⬇️ Скачиваю видео...")
+    # парсим качество/битрейт
+    quality_opts = None
+    if quality:
+        # формат: vcodec=libx264,maxrate=3000k,bufsize=6000k,acodec=aac,abitrate=160k,arate=44100
+        quality_opts = {}
+        for kv in quality.split(","):
+            k, v = kv.split("=")
+            quality_opts[k.strip()] = v.strip()
 
-    try:
-        loop = asyncio.get_event_loop()
-        filename = await loop.run_in_executor(None, download_video, url)
-        current_file = filename
+    await ctx.send("📡 Запускаю очередь...")
+    await play_next(ctx)
 
-        await msg.edit(content=f"✅ Скачано:\n`{filename}`")
-
-        await ctx.send("📡 Запускаю стрим...")
-
-        start_stream(filename)
-
-        await ctx.send("🟢 Стрим запущен!")
-
-    except Exception as e:
-        await ctx.send(f"❌ Ошибка: {e}")
-
+@bot.command()
+async def skip(ctx):
+    """Пропустить текущее видео"""
+    global current_process
+    if not streaming or not current_process:
+        await ctx.send("⚠️ Нечего пропускать")
+        return
+    current_process.send_signal(signal.SIGTERM)
+    await ctx.send("⏭ Пропущено текущее видео")
 
 @bot.command()
 async def stop(ctx):
     """Остановить стрим"""
-    global current_file
-
-    if not current_process:
-        await ctx.send("⚠️ Нет активного стрима.")
-        return
-
-    stop_stream()
-    cleanup_file(current_file)
-
-    current_file = None
-
-    await ctx.send("🔴 Стрим остановлен и файл удалён.")
-
+    global playlist, current_process, streaming
+    playlist.clear()
+    if current_process:
+        current_process.send_signal(signal.SIGTERM)
+        current_process.wait()
+    streaming = False
+    current_process = None
+    await ctx.send("🔴 Стрим остановлен и очередь очищена")
 
 @bot.command()
 async def status(ctx):
-    """Статус стрима"""
-    if current_process:
-        await ctx.send("🟢 Стрим активен.")
+    """Показать статус"""
+    if streaming and current_video:
+        await ctx.send(f"🟢 Сейчас стримим: {current_video}\nОсталось в очереди: {len(playlist)}")
     else:
-        await ctx.send("🔴 Стрим остановлен.")
-
-
-# ---------------- RUN ----------------
-bot.run(TOKEN)
+        await ctx.send("🔴 Стрим остановлен")
