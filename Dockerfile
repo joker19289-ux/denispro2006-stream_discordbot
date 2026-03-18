@@ -20,4 +20,4 @@ RUN pip install --upgrade pip
 RUN pip install discord.py==2.3.1 yt-dlp==2026.3.17.232108.dev0 python-dotenv
 
 # Команда запуска бота
-CMD ["python", "bot.py"]
+CMD ["python", "app/bot.py"]
